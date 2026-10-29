@@ -14,41 +14,79 @@ execute:
 
 ## Overview
 
-This document
+This document follows the structure of [Lecture
+12](https://skdeshpande91.github.io/stat441_fall2026/lectures/lecture12.html)
+(Bradley-Terry models; `BradleyTerry2::BTm`) and [Lecture
+13](https://skdeshpande91.github.io/stat441_fall2026/lectures/lecture13.html)
+(home-court advantage and tournament simulation where *every* simulation
+is saved so that simple, joint, and conditional probabilities can all be
+estimated afterwards).
 
-1. loads every completed 2025–26 regular-season game,
-2. fits a **Bradley-Terry model with a home-court advantage term**,
-3. simulates the **entire season (1,230 games), the play-in tournament, and the full playoffs** at least 10,000 times, and
-4. keeps *every team's* result in every simulation (wins, conference rank, playoff seed, rounds won), so you can slice it any way you like later.
+We fit **two** Bradley-Terry models to the 2025–26 NBA regular season.
 
-**The model.** For a game with home team $i$ and away team $j$:
+**Model 1: team strengths + home court** (Lecture 13). Every team $j$
+gets a fixed latent strength $\lambda_j$ (one team is the reference with
+$\lambda = 0$), and a single home-court term $\lambda_0$:
 
-$$
-\operatorname{logit} P(\text{home wins}) = h + \theta_i - \theta_j
-$$
+$$\operatorname{logit} \mathbb{P}(H \text{ beats } A) = \lambda_0 \cdot \mathbb{1}\{\text{H at home}\} + \lambda_H - \lambda_A .$$
 
-where $\theta$ is a team strength and $h$ is a single league-wide home-court advantage.
-It is fit as a logistic regression (the regular season only, so the playoffs are
-*out of sample* for the model).
+**Model 2: dynamic offense/defense + home court.** Instead of one fixed
+number per team, a team's strength *going into each game* is built from
+its offensive and defensive scores at that moment:
 
-**Parameter uncertainty.** Ratings are estimated from only 82 games per team. If we simulated with the
-point estimates, every simulated season would assume we know each team's true strength exactly, which
-overstates how predictable the league is. Instead, each simulation first draws a fresh set of
-$(h, \theta)$ from the model's estimated sampling distribution (multivariate normal around the MLE),
-then plays out the season. This matters a lot when asking whether a surprising champion is an "anomaly".
+$$\lambda_j(t) = \beta_O \, O_j(t) + \beta_D \, D_j(t),
+\qquad
+\operatorname{logit} \mathbb{P}(H \text{ beats } A \text{ at time } t) = \lambda_0 \cdot \mathbb{1}\{\text{H at home}\} + \lambda_H(t) - \lambda_A(t).$$
+
+This is the "strengths depend on covariates" extension of Bradley-Terry
+mentioned in the project description (`BradleyTerry2` fits it directly,
+because covariates are allowed to vary from row to row, just like
+`at.home` does in Lecture 13).
+
+- $O_j(t)$ = team $j$'s **offensive score** before game $t$: points
+  scored per game *above the league average*.
+- $D_j(t)$ = team $j$'s **defensive score** before game $t$: points
+  allowed per game *below the league average* (so higher is better for
+  both).
+- Both are **exponentially weighted** averages of the team's earlier
+  games (recent games count more) and are **shrunk toward 0** early in
+  the year when a team has few games. They only use games *already
+  played*, so there is no look-ahead leakage in the fit.
+
+We then **simulate the whole season, the play-in, and the playoffs at
+least 10,000 times under each model**, saving every team's outcome in
+every simulation.
+
+::: callout-note
+## How "dynamic" works inside the simulation
+
+In Model 2 the simulated season is played in chronological order. After
+each simulated game, both teams' offensive and defensive scores are
+updated from the *simulated* points, so hot and cold streaks feed into
+later win probabilities, just as in the real data. Points have to come
+from somewhere, so the simulation also uses a small points model
+(details below). The win/loss result is still drawn from the
+Bradley-Terry probability; the points are then drawn *consistent with
+that winner*.
+:::
 
 ## Settings
 
 ```{r settings}
-N_SIMS             <- 10000     # minimum requested: 10,000
+N_SIMS             <- 100000     
 SEED               <- 2026
-CHUNK              <- 1000      # sims processed at a time (memory)
-PARAM_UNCERTAINTY  <- TRUE      # draw (h, theta) from their sampling distribution each sim
+CHUNK              <- 1000      # simulations processed at a time (memory)
+PARAM_UNCERTAINTY  <- TRUE      # draw model parameters from their sampling distribution each sim
 SEASON             <- 2026      # hoopR convention: 2026 = the 2025-26 season
 FOCUS_TEAM         <- "New York Knicks"
-GAMES_CSV          <- NULL      # optional: path to a CSV with columns
-                                #   home, away, home_pts, away_pts   (regular season only)
-SIMS_FILE          <- "nba_sims_2026.rds"   # results are saved here for later analysis
+
+# Model 2 ("dynamic" ratings)
+HALF_LIFE          <- 20        # a game's weight halves after this many of the team's later games
+PRIOR_GAMES        <- 8         # shrinkage: equivalent number of "average" games every team starts with
+TEST_FRAC          <- 0.20      # last 20% of the season held out for the predictive comparison
+
+GAMES_CSV          <- NULL      # optional CSV with columns: date, home, away, home_pts, away_pts, [neutral]
+SIMS_FILE          <- "nba_sims_2026.rds"
 ```
 
 ```{r packages}
@@ -57,7 +95,8 @@ library(tidyr)
 library(ggplot2)
 library(scales)
 library(knitr)
-# install.packages(c("hoopR")) once if you don't have it (only needed if GAMES_CSV is NULL)
+# BradleyTerry2 is used with :: below (as in the lectures). Install once with
+# install.packages(c("BradleyTerry2", "hoopR"))
 ```
 
 ## Data
@@ -94,8 +133,12 @@ fix_names <- function(x) recode(x, "Los Angeles Clippers" = "LA Clippers")
 
 if (!is.null(GAMES_CSV)) {
   games <- readr::read_csv(GAMES_CSV, show_col_types = FALSE)
+  if (!"neutral" %in% names(games)) games$neutral <- FALSE
+  if (!"date"    %in% names(games)) games$date    <- seq_len(nrow(games))
+  games$date <- as.Date(games$date)
 } else {
   raw <- hoopR::load_nba_schedule(seasons = SEASON)
+  if (!"neutral_site" %in% names(raw)) raw$neutral_site <- FALSE
   games <- raw |>
     filter(season_type == 2) |>                      # 2 = regular season
     # Rows ESPN tags as regular season that are NOT part of the 82-game schedule:
@@ -108,40 +151,41 @@ if (!is.null(GAMES_CSV)) {
     # appears again as a separate "Makeup from ..." row, so drop the placeholders.
     filter(!is.na(home_score), !is.na(away_score)) |>
     filter(as.numeric(home_score) + as.numeric(away_score) > 0) |>
-    transmute(home = home_display_name, away = away_display_name,
-              home_pts = as.numeric(home_score), away_pts = as.numeric(away_score))
+    arrange(game_date, game_id) |>
+    transmute(date = as.Date(game_date),
+              home = home_display_name, away = away_display_name,
+              home_pts = as.numeric(home_score), away_pts = as.numeric(away_score),
+              # neutral-site games (NBA Global Games); the lecture handles neutral sites the same way
+              neutral = coalesce(as.logical(neutral_site), FALSE) |
+                grepl("Berlin|London|Mexico|Paris", notes_headline))
 }
 
 games <- games |>
   mutate(home = fix_names(home), away = fix_names(away))
 
-# Drop non-NBA-team games (All-Star weekend / Rising Stars exhibitions are tagged as
-# regular season in some feeds, e.g. "Team Stripes", "Team Stars", "World").
+# Drop non-NBA-team games (e.g. All-Star exhibitions: "Team Stripes", "World", ...)
 is_real <- games$home %in% teams$team & games$away %in% teams$team
 if (any(!is_real)) {
-  cat("Dropping", sum(!is_real), "non-team games:",
-      paste(unique(c(games$home[!is_real], games$away[!is_real])[
-        !(c(games$home[!is_real], games$away[!is_real]) %in% teams$team)]), collapse = ", "), "\n")
+  bad <- c(games$home[!is_real], games$away[!is_real])
+  cat("Dropping", sum(!is_real), "non-team games:", paste(unique(bad[!bad %in% teams$team]), collapse = ", "), "\n")
 }
-games <- games[is_real, ]
 
-games <- games |>
+games <- games[is_real, ] |>
+  mutate(ord = row_number()) |>
+  arrange(date, ord) |>                       # chronological order (stable within a date)
   left_join(teams |> select(team, home_id = id), by = c("home" = "team")) |>
   left_join(teams |> select(team, away_id = id), by = c("away" = "team")) |>
-  mutate(home_win = as.integer(home_pts > away_pts))
+  mutate(home_win = as.integer(home_pts > away_pts),
+         at_home  = if_else(neutral, 0L, 1L),   # 1 = home team at its own arena, 0 = neutral site
+         game_no  = row_number())
 
 # ---- sanity checks -----------------------------------------------------------
-if (anyNA(games$home_id) || anyNA(games$away_id)) {
-  stop("Unmatched team names: ",
-       paste(unique(c(games$home[is.na(games$home_id)], games$away[is.na(games$away_id)])),
-             collapse = ", "))
-}
 gp <- table(c(games$home_id, games$away_id))
 if (nrow(games) != 1230 || any(gp != 82)) {
   warning("Expected 1,230 games and 82 per team, got ", nrow(games),
-          " games (per team: ", min(gp), "-", max(gp), "). ",
-          "If an NBA Cup final or other non-regular-season game slipped in, drop it before continuing.")
+          " games (per team: ", min(gp), "-", max(gp), ").")
 }
+cat(nrow(games), "games loaded,", sum(games$neutral), "at neutral sites.\n")
 ```
 
 ```{r actual-standings}
@@ -155,98 +199,265 @@ actual <- bind_rows(
   group_by(conf) |>
   mutate(actual_conf_rank = rank(-actual_wins, ties.method = "min")) |>   # wins only; no tiebreakers
   ungroup()
-
-cat(nrow(games), "games loaded.\n")
 ```
 
-## Fit the Bradley-Terry model
+### Building the dynamic offensive and defensive scores
 
-The team indicator matrix has +1 for the home team and −1 for the away team. The first team
-(alphabetically) is the reference with $\theta = 0$; only differences matter. The intercept is $h$.
+For each team, we keep a running (exponentially decayed) tally over its
+games *in chronological order*. Before every game we record each team's
+current $O_j(t)$ and $D_j(t)$, then update the tallies using that game's
+points:
 
-```{r fit-bt}
-X <- matrix(0, nrow(games), n_teams)
-X[cbind(seq_len(nrow(games)), games$home_id)] <-  1
-X[cbind(seq_len(nrow(games)), games$away_id)] <- -1
-X <- X[, -1, drop = FALSE]
+$$O_j(t) = \frac{\sum_k w_k \,(\text{pts for}_k - \bar{p})}{\sum_k w_k + c},
+\qquad
+D_j(t) = \frac{\sum_k w_k \,(\bar{p} - \text{pts against}_k)}{\sum_k w_k + c},
+\qquad
+w_k = 0.5^{\,(\text{games since } k)/\text{half-life}},$$
 
-fit <- glm(games$home_win ~ X, family = binomial)
+where $\bar{p}$ is the league-average points per team per game and $c$
+is `PRIOR_GAMES`. (Pace is not removed: only final scores are in the
+schedule feed. See the limitations at the end.)
 
-beta_hat <- coef(fit)          # [1] = h, [2:30] = theta for teams 2..30
-V        <- vcov(fit)
+```{r dynamic-ratings}
+LEAGUE_MEAN <- mean(c(games$home_pts, games$away_pts))
+rho         <- 0.5^(1 / HALF_LIFE)
 
-h_hat     <- unname(beta_hat[1])
-theta_hat <- c(0, unname(beta_hat[-1]))
+dynamic_ratings <- function(gm) {
+  n <- nrow(gm)
+  S_off <- S_def <- W <- numeric(n_teams)
+  pre <- matrix(0, n, 4, dimnames = list(NULL, c("off_h", "def_h", "off_a", "def_a")))
+  for (k in seq_len(n)) {
+    h <- gm$home_id[k]; a <- gm$away_id[k]
+    # ratings BEFORE the game (only past games used)
+    pre[k, ] <- c(S_off[h] / (W[h] + PRIOR_GAMES), S_def[h] / (W[h] + PRIOR_GAMES),
+                  S_off[a] / (W[a] + PRIOR_GAMES), S_def[a] / (W[a] + PRIOR_GAMES))
+    # then update both teams with this game
+    S_off[h] <- rho * S_off[h] + (gm$home_pts[k] - LEAGUE_MEAN)
+    S_def[h] <- rho * S_def[h] + (LEAGUE_MEAN - gm$away_pts[k])
+    W[h]     <- rho * W[h] + 1
+    S_off[a] <- rho * S_off[a] + (gm$away_pts[k] - LEAGUE_MEAN)
+    S_def[a] <- rho * S_def[a] + (LEAGUE_MEAN - gm$home_pts[k])
+    W[a]     <- rho * W[a] + 1
+  }
+  list(pre = tibble::as_tibble(pre),
+       end = tibble(team_id = seq_len(n_teams),
+                    off = S_off / (W + PRIOR_GAMES), def = S_def / (W + PRIOR_GAMES)))
+}
 
-ratings <- teams |>
-  mutate(theta = theta_hat - mean(theta_hat),            # centre so the league average = 0
-         p_vs_avg_neutral = plogis(theta)) |>
-  left_join(actual |> select(id, actual_wins), by = "id") |>
-  arrange(desc(theta))
+dyn   <- dynamic_ratings(games)
+games <- bind_cols(games, dyn$pre)
+```
 
-cat(sprintf("Home-court advantage: h = %.3f log-odds -> %.1f%% home win prob between equal teams\n",
-            h_hat, 100 * plogis(h_hat)))
+```{r dynamic-plot}
+bind_rows(
+  games |> transmute(team = home, game_no, Offense = off_h, Defense = def_h),
+  games |> transmute(team = away, game_no, Offense = off_a, Defense = def_a)
+) |>
+  filter(team == FOCUS_TEAM) |>
+  arrange(game_no) |>
+  mutate(team_game = row_number()) |>
+  pivot_longer(c(Offense, Defense), names_to = "Score", values_to = "value") |>
+  ggplot(aes(team_game, value, colour = Score)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = c(Offense = "#F58426", Defense = "#006BB6")) +
+  labs(title = paste(FOCUS_TEAM, "- dynamic offensive and defensive scores"),
+       subtitle = "Points per game vs. league average, going INTO each game (higher = better)",
+       x = "Team's game number", y = "Score (points/game vs. average)")
+```
+
+## Fitting the models
+
+### Model 1: team strengths + home court (Lecture 13)
+
+Games are grouped by (home team, away team, neutral-site flag);
+`at.home` is 1 for home-arena games and 0 for neutral sites, exactly as
+in Lecture 13.
+
+```{r fit-bt1}
+fit_bt1 <- function(gm) {
+  res <- gm |>
+    group_by(home, away, at_home) |>
+    summarise(home.win = sum(home_win), away.win = sum(1 - home_win), .groups = "drop")
+  df <- data.frame(home.win = res$home.win, away.win = res$away.win)
+  df$home.team <- data.frame(team = factor(res$home, levels = teams$team), at.home = res$at_home)
+  df$away.team <- data.frame(team = factor(res$away, levels = teams$team), at.home = 0)
+  BradleyTerry2::BTm(
+    outcome = cbind(home.win, away.win),
+    player1 = home.team, player2 = away.team,
+    formula = ~ team + at.home,
+    refcat  = teams$team[1],
+    id      = "team",
+    data    = df)
+}
+
+fit1 <- fit_bt1(games)
+lambda_hat  <- BradleyTerry2::BTabilities(fit1)
+lambda0_hat <- unname(coef(fit1)["at.home"])
+
+cat(sprintf("Model 1 home-court term: lambda0 = %.3f log-odds -> %.1f%% home win prob. between equal teams\n",
+            lambda0_hat, 100 * plogis(lambda0_hat)))
+```
+
+### Model 2: dynamic offense/defense + home court
+
+Now every *game* is its own row, because the covariates change from game
+to game. Each team's data frame carries `at.home` and its pre-game
+offensive and defensive scores (`off_rtg`, `def_rtg`). `BTm`
+automatically uses the *difference* between the two teams' covariates.
+
+```{r fit-bt2}
+fit_bt2 <- function(gm) {
+  df <- data.frame(home.win = gm$home_win, away.win = 1 - gm$home_win)
+  df$home.team <- data.frame(team = factor(gm$home, levels = teams$team), at.home = gm$at_home,
+                             off_rtg = gm$off_h, def_rtg = gm$def_h)
+  df$away.team <- data.frame(team = factor(gm$away, levels = teams$team), at.home = 0,
+                             off_rtg = gm$off_a, def_rtg = gm$def_a)
+  # (BradleyTerry2 notes that ability is modelled by predictors with no team random effect; that is intended.)
+  suppressWarnings(
+    BradleyTerry2::BTm(
+      outcome = cbind(home.win, away.win),
+      player1 = home.team, player2 = away.team,
+      formula = ~ off_rtg + def_rtg + at.home,
+      id      = "team",
+      data    = df))
+}
+
+fit2 <- fit_bt2(games)
+kable(summary(fit2)$coefficients, digits = 4,
+      caption = "Model 2 coefficients (log-odds per 1 point/game of offensive or defensive score)")
+```
+
+### Do dynamic offense/defense scores help? Predictive comparison
+
+We compare both models, plus a "home court only" baseline, on log-loss
+(lower is better), Brier score (lower is better), and accuracy.
+"Out-of-sample" means the models are refit on the first
+`r percent(1 - TEST_FRAC)` of the season and scored on the remaining
+games.
+
+```{r compare}
+pred_bt1 <- function(fit, gm) {
+  ab <- BradleyTerry2::BTabilities(fit)[, "ability"]
+  plogis(ab[gm$home] - ab[gm$away] + coef(fit)["at.home"] * gm$at_home)
+}
+pred_bt2 <- function(fit, gm) {
+  cf <- coef(fit)
+  plogis(cf["off_rtg"] * (gm$off_h - gm$off_a) + cf["def_rtg"] * (gm$def_h - gm$def_a) +
+           cf["at.home"] * gm$at_home)
+}
+metrics <- function(p, y) {
+  p <- pmin(pmax(unname(p), 1e-9), 1 - 1e-9)
+  c(`Log-loss` = -mean(y * log(p) + (1 - y) * log(1 - p)),
+    Brier = mean((p - y)^2), Accuracy = mean((p > 0.5) == y))
+}
+
+n_train <- floor(nrow(games) * (1 - TEST_FRAC))
+train <- games[seq_len(n_train), ]
+test  <- games[-seq_len(n_train), ]
+
+fit1_tr <- fit_bt1(train); fit2_tr <- fit_bt2(train)
+base_p  <- mean(train$home_win)
+
+bind_rows(
+  tibble(Evaluation = "In-sample (all games)", Model = "Home court only",
+         !!!as.list(metrics(rep(mean(games$home_win), nrow(games)), games$home_win))),
+  tibble(Evaluation = "In-sample (all games)", Model = "Model 1 (team strengths)",
+         !!!as.list(metrics(pred_bt1(fit1, games), games$home_win))),
+  tibble(Evaluation = "In-sample (all games)", Model = "Model 2 (dynamic O/D)",
+         !!!as.list(metrics(pred_bt2(fit2, games), games$home_win))),
+  tibble(Evaluation = "Out-of-sample (last games)", Model = "Home court only",
+         !!!as.list(metrics(rep(base_p, nrow(test)), test$home_win))),
+  tibble(Evaluation = "Out-of-sample (last games)", Model = "Model 1 (team strengths)",
+         !!!as.list(metrics(pred_bt1(fit1_tr, test), test$home_win))),
+  tibble(Evaluation = "Out-of-sample (last games)", Model = "Model 2 (dynamic O/D)",
+         !!!as.list(metrics(pred_bt2(fit2_tr, test), test$home_win)))
+) |> kable(digits = 3)
+```
+
+Model 1 spends 30 parameters on team strengths; Model 2 uses only 3
+(offense, defense, home court). The out-of-sample rows are the fairer
+comparison.
+
+```{r calibration-plot}
+exp_w <- function(p, gm) {
+  bind_rows(tibble(id = gm$home_id, p = p), tibble(id = gm$away_id, p = 1 - p)) |>
+    group_by(id) |> summarise(e = sum(p), .groups = "drop")
+}
+calib <- bind_rows(
+  actual |> left_join(exp_w(pred_bt1(fit1, games), games), by = "id") |> mutate(model = "Model 1"),
+  actual |> left_join(exp_w(pred_bt2(fit2, games), games), by = "id") |> mutate(model = "Model 2")
+)
+ggplot(calib, aes(e, actual_wins, label = team)) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  geom_point(colour = "#006BB6") +
+  geom_text(size = 2.2, vjust = -0.7, check_overlap = TRUE) +
+  facet_wrap(~model) +
+  labs(x = "Model-expected wins", y = "Actual wins",
+       title = "Expected vs. actual regular-season wins")
 ```
 
 ```{r ratings-table}
+ratings <- teams |>
+  left_join(tibble(team = rownames(lambda_hat), lambda = lambda_hat[, "ability"]), by = "team") |>
+  mutate(lambda = lambda - mean(lambda)) |>
+  left_join(dyn$end |> transmute(id = team_id, `Off. score (end)` = off, `Def. score (end)` = def), by = "id") |>
+  left_join(actual |> select(id, actual_wins), by = "id") |>
+  arrange(desc(lambda))
+
 ratings |>
-  transmute(Team = team, Conf = conf, `Rating (θ)` = round(theta, 3),
-            `Win % vs avg team (neutral)` = percent(p_vs_avg_neutral, 0.1),
+  transmute(Team = team, Conf = conf, `Model 1 strength (λ, centred)` = round(lambda, 2),
+            `Off. score at season end` = round(`Off. score (end)`, 2),
+            `Def. score at season end` = round(`Def. score (end)`, 2),
             `Actual wins` = actual_wins) |>
   kable()
 ```
 
-A quick calibration check: the model's expected wins from the fitted game probabilities should track actual wins.
-
-```{r calibration}
-games$p_hat <- fitted(fit)
-exp_w <- bind_rows(
-  games |> transmute(id = home_id, p = p_hat),
-  games |> transmute(id = away_id, p = 1 - p_hat)
-) |> group_by(id) |> summarise(expected_wins = sum(p), .groups = "drop")
-
-calib <- actual |> left_join(exp_w, by = "id")
-```
-
-```{r calibration-plot}
-ggplot(calib, aes(expected_wins, actual_wins, label = team)) +
-  geom_abline(linetype = 2, colour = "grey50") +
-  geom_point(colour = "#006BB6") +
-  geom_text(size = 2.5, vjust = -0.7, check_overlap = TRUE) +
-  labs(x = "Model-expected wins", y = "Actual wins",
-       title = "Bradley-Terry fit vs. actual regular-season wins")
-```
-
 ## Simulation engine
 
-Everything is vectorised across simulations: each function takes a vector of teams (one entry per
-simulation) and returns a vector of winners. Simplifications to be aware of:
+Everything is vectorised across simulations: each function takes a
+vector of teams (one entry per simulation) and returns a vector of
+winners. Both models share the **same** seeding, play-in, and playoff
+code; they differ only in how regular-season games are simulated and in
+the team strengths used for playoff games.
 
-* **Tiebreakers:** regular-season ties are broken randomly (no head-to-head / division rules).
-* **Play-in:** 7v8 winner is the 7 seed; loser hosts the winner of 9v10 for the 8 seed. Higher seed hosts.
-* **Series:** best-of-7, 2-2-1-1-1, higher seed has home court; the Finals give home court to the team with more regular-season wins.
-* **Injuries, rest, trades, and in-season changes in strength** are not modelled. Ratings are constant for the whole season and playoffs.
+Common simplifications:
 
-```{r engine}
-# --- draw model parameters for n simulations -------------------------------------
-draw_params <- function(n) {
-  if (PARAM_UNCERTAINTY) {
-    L <- t(chol(V))
-    B <- beta_hat + L %*% matrix(rnorm(length(beta_hat) * n), ncol = n)
+- **Tiebreakers:** regular-season ties are broken randomly (no
+  head-to-head / division rules).
+- **Play-in:** 7v8 winner is the 7 seed; the loser hosts the winner of
+  9v10 for the 8 seed.
+- **Series:** best-of-7, 2-2-1-1-1, higher seed has home court; the
+  Finals give home court to the team with more regular-season wins.
+- **Parameter uncertainty:** each simulation draws its own model
+  parameters from a multivariate normal with the fitted coefficients and
+  covariance matrix (`PARAM_UNCERTAINTY`).
+- **Model 2 in the playoffs:** team strength is frozen at each team's
+  *end-of-regular-season* offensive and defensive scores (their form
+  going into the playoffs).
+
+### Shared tools
+
+```{r engine-common}
+mvn_draw <- function(cf, V, n) {
+  if (!PARAM_UNCERTAINTY) {
+    B <- matrix(cf, length(cf), n)
   } else {
-    B <- matrix(beta_hat, nrow = length(beta_hat), ncol = n)
+    L <- t(chol(V))
+    B <- cf + L %*% matrix(rnorm(length(cf) * n), ncol = n)
   }
-  list(h = B[1, ], Theta = rbind(0, B[-1, , drop = FALSE]))   # Theta: 30 x n
+  rownames(B) <- names(cf)
+  B
 }
 
-# --- one game: `home` and `away` are team-id vectors (length n) ------------------
+# --- one game: `home` and `away` are team-id vectors (length n); P = list(h, Theta) ---
 play_game <- function(home, away, P) {
   n   <- length(home); idx <- seq_len(n)
   eta <- P$h + P$Theta[cbind(home, idx)] - P$Theta[cbind(away, idx)]
   ifelse(runif(n) < plogis(eta), home, away)
 }
 
-# --- best-of-7, team `a` has home court (games 1,2,5,7 at a) ---------------------
+# --- best-of-7, team `a` has home court (games 1,2,5,7 at a) ---
 play_series <- function(a, b, P) {
   n <- length(a); idx <- seq_len(n)
   d <- P$Theta[cbind(a, idx)] - P$Theta[cbind(b, idx)]
@@ -258,23 +469,20 @@ play_series <- function(a, b, P) {
   ifelse(wins_a >= 4, a, b)
 }
 
-# --- series where home court goes to the lower "seed score" ----------------------
+# --- series where home court goes to the lower "seed score" ---
 series_by_seed <- function(t1, s1, t2, s2, P) {
   swap <- s2 < s1
   a <- ifelse(swap, t2, t1); b <- ifelse(swap, t1, t2)
   w <- play_series(a, b, P)
   t1_won <- w == t1
-  list(win = w, win_seed = ifelse(t1_won, s1, s2),
-       lose = ifelse(t1_won, t2, t1))
+  list(win = w, win_seed = ifelse(t1_won, s1, s2), lose = ifelse(t1_won, t2, t1))
 }
 
-# --- one conference: play-in + 4 rounds ------------------------------------------
-# S: 15 x n matrix of team ids ordered by regular-season rank
+# --- one conference: play-in + 4 rounds. S: 15 x n matrix of team ids ordered by rank ---
 sim_conference <- function(S, P, rounds_won, playoff_seed) {
   n <- ncol(S); idx <- seq_len(n)
   rec <- function(mat, team, value) { mat[cbind(team, idx)] <- value; mat }
 
-  # play-in
   w78  <- play_game(S[7, ], S[8, ], P)
   l78  <- ifelse(w78 == S[7, ], S[8, ], S[7, ])
   w910 <- play_game(S[9, ], S[10, ], P)
@@ -283,41 +491,156 @@ sim_conference <- function(S, P, rounds_won, playoff_seed) {
   for (s in 1:8) playoff_seed <- rec(playoff_seed, T8[s, ], s)
 
   sd <- function(s) rep(s, n)
-  # round 1
   a <- series_by_seed(T8[1, ], sd(1), T8[8, ], sd(8), P)
   b <- series_by_seed(T8[4, ], sd(4), T8[5, ], sd(5), P)
   c <- series_by_seed(T8[3, ], sd(3), T8[6, ], sd(6), P)
   d <- series_by_seed(T8[2, ], sd(2), T8[7, ], sd(7), P)
   for (x in list(a, b, c, d)) rounds_won <- rec(rounds_won, x$lose, 0L)
-  # round 2
   e <- series_by_seed(a$win, a$win_seed, b$win, b$win_seed, P)
   f <- series_by_seed(c$win, c$win_seed, d$win, d$win_seed, P)
   for (x in list(e, f)) rounds_won <- rec(rounds_won, x$lose, 1L)
-  # conference finals
   g <- series_by_seed(e$win, e$win_seed, f$win, f$win_seed, P)
   rounds_won <- rec(rounds_won, g$lose, 2L)
 
   list(champ = g$win, rounds_won = rounds_won, playoff_seed = playoff_seed)
 }
+```
 
-# --- a chunk of n full seasons + postseasons -------------------------------------
-simulate_chunk <- function(n, sim_offset = 0L) {
-  P   <- draw_params(n)
+### Model 1 regular season
+
+```{r engine-bt1}
+cf1 <- coef(fit1); V1 <- vcov(fit1)
+
+regseason_bt1 <- function(n) {
+  B <- mvn_draw(cf1, V1, n)
+  P <- list(h = B["at.home", ],
+            Theta = rbind(0, B[paste0("team", teams$team[-1]), , drop = FALSE]))   # 30 x n (ref team = 0)
+  eta <- P$Theta[games$home_id, , drop = FALSE] - P$Theta[games$away_id, , drop = FALSE] +
+         outer(games$at_home, P$h)
+  list(home_win = matrix(runif(length(eta)) < plogis(eta), nrow = nrow(eta)), P = P)
+}
+```
+
+### Model 2 regular season (dynamic)
+
+To update offensive and defensive scores inside the simulation we need
+simulated **points**. We fit a simple points model to the real games,
+
+$$\text{pts}_{\text{team } i \text{ vs. opp } j} = \mu + \eta \cdot \mathbb{1}\{\text{home}\} + a_i + d_j + \varepsilon,
+\qquad \varepsilon \sim N(0, \sigma^2),$$
+
+where $a_i$ is team $i$'s true offensive level and $d_j$ is how many
+points opponent $j$ tends to allow. In the simulation, the game winner
+is drawn from the Bradley-Terry probability computed from the teams'
+*current simulated* scores. Then the final margin is drawn from the
+points model **conditional on that winner** (a truncated normal), and
+the total points from the points model, so that the points a team scores
+and allows are consistent with the result. Those points update both
+teams' scores before the next game.
+
+```{r engine-bt2}
+# ---- points model (used only to generate points in the Model 2 simulation) ----
+pts_long <- bind_rows(
+  games |> transmute(pts = home_pts, is_home = at_home,
+                     off_team = factor(home, levels = teams$team), def_opp = factor(away, levels = teams$team)),
+  games |> transmute(pts = away_pts, is_home = 0L,
+                     off_team = factor(away, levels = teams$team), def_opp = factor(home, levels = teams$team))
+)
+fit_pts   <- lm(pts ~ is_home + off_team + def_opp, data = pts_long)
+sigma_pts <- sigma(fit_pts)
+cfp <- coef(fit_pts); Vp <- vcov(fit_pts)
+cat(sprintf("Points model: residual sd = %.1f pts/team/game; home effect = %.2f pts\n",
+            sigma_pts, cfp["is_home"]))
+
+# ---- chronological batches: every team appears at most once per batch ----
+# A game depends only on the earlier games of its two teams, so processing games in
+# "levels" gives exactly the same results as processing them one at a time.
+make_batches <- function(gm) {
+  last <- integer(n_teams); b <- integer(nrow(gm))
+  for (k in seq_len(nrow(gm))) {
+    bk <- max(last[gm$home_id[k]], last[gm$away_id[k]]) + 1L
+    b[k] <- bk; last[gm$home_id[k]] <- bk; last[gm$away_id[k]] <- bk
+  }
+  unname(split(seq_len(nrow(gm)), b))
+}
+batches <- make_batches(games)
+
+cf2 <- coef(fit2); V2 <- vcov(fit2)
+cs <- function(M, v) M * rep(v, each = nrow(M))        # multiply column j of M by v[j]
+
+regseason_bt2 <- function(n) {
+  B     <- mvn_draw(cf2, V2, n)
+  b_off <- B["off_rtg", ]; b_def <- B["def_rtg", ]; b_home <- B["at.home", ]
+  Q     <- mvn_draw(cfp, Vp, n)
+  mu    <- Q["(Intercept)", ]; eta_p <- Q["is_home", ]
+  Aef   <- rbind(0, Q[paste0("off_team", teams$team[-1]), , drop = FALSE])   # 30 x n
+  Def   <- rbind(0, Q[paste0("def_opp",  teams$team[-1]), , drop = FALSE])   # 30 x n
+  s     <- sqrt(2) * sigma_pts                  # sd of both the margin and the total
+
+  S_off <- S_def <- W <- matrix(0, n_teams, n)
+  home_win <- matrix(FALSE, nrow(games), n)
+
+  for (ix in batches) {
+    H <- games$home_id[ix]; A <- games$away_id[ix]; ah <- games$at_home[ix]; G <- length(ix)
+
+    # pre-game dynamic scores for both teams (30 x n state -> G x n)
+    offH <- S_off[H, , drop = FALSE] / (W[H, , drop = FALSE] + PRIOR_GAMES)
+    offA <- S_off[A, , drop = FALSE] / (W[A, , drop = FALSE] + PRIOR_GAMES)
+    defH <- S_def[H, , drop = FALSE] / (W[H, , drop = FALSE] + PRIOR_GAMES)
+    defA <- S_def[A, , drop = FALSE] / (W[A, , drop = FALSE] + PRIOR_GAMES)
+
+    # Bradley-Terry win probability for the home team
+    eta <- cs(offH - offA, b_off) + cs(defH - defA, b_def) + outer(ah, b_home)
+    hw  <- matrix(runif(G * n) < plogis(eta), nrow = G)
+    home_win[ix, ] <- hw
+
+    # points consistent with the winner (margin ~ truncated normal, total ~ normal)
+    m_exp <- outer(ah, eta_p) + Aef[H, , drop = FALSE] + Def[A, , drop = FALSE] -
+             Aef[A, , drop = FALSE] - Def[H, , drop = FALSE]
+    t_exp <- matrix(rep(2 * mu, each = G), nrow = G) + outer(ah, eta_p) +
+             Aef[H, , drop = FALSE] + Def[A, , drop = FALSE] + Aef[A, , drop = FALSE] + Def[H, , drop = FALSE]
+    p_pos <- pnorm(m_exp / s)
+    u     <- matrix(runif(G * n), nrow = G)
+    q     <- ifelse(hw, (1 - p_pos) + u * p_pos, u * (1 - p_pos))
+    q     <- pmin(pmax(q, 1e-10), 1 - 1e-10)
+    Marg  <- m_exp + s * qnorm(q)
+    Tot   <- t_exp + s * matrix(rnorm(G * n), nrow = G)
+    hp    <- (Tot + Marg) / 2
+    ap    <- (Tot - Marg) / 2
+
+    # update both teams' running offense/defense tallies
+    S_off[H, ] <- rho * S_off[H, , drop = FALSE] + (hp - LEAGUE_MEAN)
+    S_def[H, ] <- rho * S_def[H, , drop = FALSE] + (LEAGUE_MEAN - ap)
+    W[H, ]     <- rho * W[H, , drop = FALSE] + 1
+    S_off[A, ] <- rho * S_off[A, , drop = FALSE] + (ap - LEAGUE_MEAN)
+    S_def[A, ] <- rho * S_def[A, , drop = FALSE] + (LEAGUE_MEAN - hp)
+    W[A, ]     <- rho * W[A, , drop = FALSE] + 1
+  }
+
+  # playoff strength = end-of-regular-season offensive/defensive scores
+  off_end <- S_off / (W + PRIOR_GAMES); def_end <- S_def / (W + PRIOR_GAMES)
+  list(home_win = home_win,
+       P = list(h = b_home, Theta = cs(off_end, b_off) + cs(def_end, b_def)))
+}
+```
+
+### One chunk of seasons + postseasons
+
+```{r engine-chunk}
+simulate_chunk <- function(n, model, sim_offset = 0L) {
+  rs  <- if (model == "bt1") regseason_bt1(n) else regseason_bt2(n)
+  P   <- rs$P
   idx <- seq_len(n)
 
-  # regular season (actual 1,230-game schedule)
-  eta <- P$Theta[games$home_id, , drop = FALSE] - P$Theta[games$away_id, , drop = FALSE]
-  eta <- sweep(eta, 2, P$h, "+")
-  home_win <- matrix(runif(length(eta)) < plogis(eta), nrow = nrow(eta))
-  wins <- rowsum(home_win + 0, games$home_id) + rowsum(1 - home_win, games$away_id)  # 30 x n
+  wins <- rowsum(rs$home_win + 0, games$home_id) + rowsum(1 - rs$home_win, games$away_id)  # 30 x n
 
   # seeding within each conference (random tiebreak)
-  conf_rank    <- matrix(NA_integer_, n_teams, n)
-  S_list       <- vector("list", 2)
+  conf_rank <- matrix(NA_integer_, n_teams, n)
+  S_list    <- vector("list", 2)
   for (cf in 1:2) {
     ids <- teams$id[teams$conf_id == cf]
     w   <- wins[ids, , drop = FALSE] + matrix(runif(length(ids) * n, 0, 0.5), nrow = length(ids))
-    ord <- apply(w, 2, function(x) order(-x))                     # 15 x n (positions in `ids`)
+    ord <- apply(w, 2, function(x) order(-x))
     S   <- matrix(ids[ord], nrow = length(ids))
     for (r in seq_len(nrow(S))) conf_rank[cbind(S[r, ], idx)] <- r
     S_list[[cf]] <- S
@@ -339,12 +662,13 @@ simulate_chunk <- function(n, sim_offset = 0L) {
   rounds_won[cbind(fin$win,  idx)] <- 4L
 
   tibble(
+    model        = model,
     sim          = rep(idx + sim_offset, each = n_teams),
     team_id      = rep(seq_len(n_teams), times = n),
     wins         = as.vector(wins),
     conf_rank    = as.vector(conf_rank),
     playoff_seed = as.vector(playoff_seed),
-    # -1 = missed playoffs/lost play-in, 0 = lost R1, 1 = lost R2, 2 = lost conf finals,
+    # -1 = missed playoffs / lost play-in, 0 = lost R1, 1 = lost R2, 2 = lost conf finals,
     #  3 = lost Finals, 4 = champion
     rounds_won   = coalesce(as.vector(rounds_won), -1L)
   )
@@ -353,29 +677,40 @@ simulate_chunk <- function(n, sim_offset = 0L) {
 
 ## Run the simulations
 
+Each simulation replication is a complete 1,230-game season, play-in,
+and playoffs. As in Lecture 13, we save every team's results in every
+simulation, so we can later estimate simple events, joint events, and
+conditional probabilities from the same table.
+
 ```{r run-sims}
-set.seed(SEED)
+run_model <- function(model) {
+  set.seed(SEED)
+  starts <- seq(0L, N_SIMS - 1L, by = CHUNK)
+  bind_rows(lapply(starts, function(s) simulate_chunk(min(CHUNK, N_SIMS - s), model, s)))
+}
+
+model_labels <- c(bt1 = "Model 1 (team strengths)", bt2 = "Model 2 (dynamic O/D)")
+
 t0 <- Sys.time()
-starts <- seq(0L, N_SIMS - 1L, by = CHUNK)
-sims <- bind_rows(lapply(starts, function(s) simulate_chunk(min(CHUNK, N_SIMS - s), s))) |>
-  left_join(teams |> select(team_id = id, team, conf), by = "team_id")
+sims <- bind_rows(run_model("bt1"), run_model("bt2")) |>
+  left_join(teams |> select(team_id = id, team, conf), by = "team_id") |>
+  mutate(model = factor(model_labels[model], levels = model_labels))
 
 # integrity checks: exactly one champion per sim, 8 playoff teams per conference per sim
 stopifnot(
-  n_distinct(sims$sim) == N_SIMS,
-  all(sims |> group_by(sim) |> summarise(k = sum(rounds_won == 4)) |> pull(k) == 1),
-  all(sims |> filter(!is.na(playoff_seed)) |> count(sim, conf) |> pull(n) == 8)
+  all(sims |> group_by(model, sim) |> summarise(k = sum(rounds_won == 4), .groups = "drop") |> pull(k) == 1),
+  all(sims |> filter(!is.na(playoff_seed)) |> count(model, sim, conf) |> pull(n) == 8)
 )
 
 saveRDS(sims, SIMS_FILE)
-cat(sprintf("%s simulated seasons x 30 teams = %s rows in %.1f s. Saved to %s\n",
+cat(sprintf("2 models x %s simulated seasons x 30 teams = %s rows in %.0f s. Saved to %s\n",
             comma(N_SIMS), comma(nrow(sims)),
             as.numeric(difftime(Sys.time(), t0, units = "secs")), SIMS_FILE))
 ```
 
-`sims` is a tidy table with one row per **team per simulation**: `wins`, `conf_rank` (1–15 by
-regular-season record), `playoff_seed` (1–8 after the play-in, `NA` if missed), and `rounds_won`.
-It is also saved to disk (`readRDS("nba_sims_2026.rds")`).
+`sims` has one row per **model × simulation × team**: `wins`,
+`conf_rank` (1–15), `playoff_seed` (1–8 after the play-in; `NA` if
+missed), and `rounds_won`.
 
 ## Where the Knicks *should* have finished
 
@@ -388,20 +723,22 @@ k_sims   <- sims |> filter(team == FOCUS_TEAM)
 ggplot(k_sims, aes(wins)) +
   geom_histogram(binwidth = 1, fill = "#F58426", colour = "white") +
   geom_vline(xintercept = k_actual$actual_wins, colour = "#006BB6", linewidth = 1) +
-  annotate("text", x = k_actual$actual_wins, y = Inf, vjust = 1.5, hjust = -0.1,
-           label = paste("Actual:", k_actual$actual_wins, "wins"), colour = "#006BB6") +
+  facet_wrap(~model, ncol = 1) +
   labs(title = paste(FOCUS_TEAM, "- simulated regular-season wins"),
+       subtitle = paste0("Blue line = actual wins (", k_actual$actual_wins, ")"),
        x = "Wins", y = paste("Simulations (of", comma(N_SIMS), ")"))
 ```
 
 ```{r knicks-rank}
 k_sims |>
-  count(conf_rank) |>
+  count(model, conf_rank) |>
   mutate(p = n / N_SIMS) |>
   ggplot(aes(factor(conf_rank), p)) +
   geom_col(fill = "#F58426") +
-  geom_point(data = tibble(conf_rank = k_actual$actual_conf_rank, p = 0),
+  geom_point(data = tidyr::crossing(model = levels(sims$model), conf_rank = k_actual$actual_conf_rank) |>
+               mutate(model = factor(model, levels = levels(sims$model)), p = 0),
              shape = 25, size = 4, fill = "#006BB6") +
+  facet_wrap(~model, ncol = 1) +
   scale_y_continuous(labels = percent) +
   labs(title = "Knicks' simulated Eastern Conference finish",
        subtitle = "Blue triangle = actual finish (by wins)",
@@ -409,124 +746,158 @@ k_sims |>
 ```
 
 ```{r knicks-summary}
-tibble(
-  Metric = c("Actual regular-season wins",
-             "Mean simulated wins",
-             "P(simulated wins ≥ actual)",
-             "Actual East rank (by wins)",
-             "Mean simulated East rank",
-             "Most likely East rank",
-             "P(finish as East #1 seed)",
-             "P(finish in East top 2)",
-             "P(make playoffs - top 6 or play-in win)",
-             "P(win the East)",
-             "P(win the title)"),
-  Value = c(k_actual$actual_wins,
-            round(mean(k_sims$wins), 1),
-            percent(mean(k_sims$wins >= k_actual$actual_wins), 0.1),
-            k_actual$actual_conf_rank,
-            round(mean(k_sims$conf_rank), 2),
-            as.integer(names(which.max(table(k_sims$conf_rank)))),
-            percent(mean(k_sims$conf_rank == 1), 0.1),
-            percent(mean(k_sims$conf_rank <= 2), 0.1),
-            percent(mean(!is.na(k_sims$playoff_seed)), 0.1),
-            percent(mean(k_sims$rounds_won >= 3), 0.1),
-            percent(mean(k_sims$rounds_won == 4), 0.2))
-) |> kable()
+knicks_summary <- function(d) {
+  c(round(mean(d$wins), 1),
+    percent(mean(d$wins >= k_actual$actual_wins), 0.1),
+    round(mean(d$conf_rank), 2),
+    names(which.max(table(d$conf_rank))),
+    percent(mean(d$conf_rank == 1), 0.1),
+    percent(mean(d$conf_rank <= 2), 0.1),
+    percent(mean(!is.na(d$playoff_seed)), 0.1),
+    percent(mean(d$rounds_won >= 3), 0.1),
+    percent(mean(d$rounds_won == 4), 0.2))
+}
+tab <- sapply(split(k_sims, k_sims$model), knicks_summary)
+rownames(tab) <- c("Mean simulated wins",
+                   paste0("P(simulated wins ≥ actual ", k_actual$actual_wins, ")"),
+                   "Mean simulated East rank", "Most likely East rank",
+                   "P(East #1 seed)", "P(East top 2)", "P(make playoffs)",
+                   "P(win the East)", "P(win the title)")
+kable(tab, caption = paste0("Actual: ", k_actual$actual_wins, " wins, East rank ", k_actual$actual_conf_rank,
+                            " (by wins; no tiebreakers)"))
 ```
 
 ## Was the title an anomaly?
 
-Everyone's title probability (with Monte Carlo standard errors):
+Championship probabilities for every team, under both models (Monte
+Carlo standard errors are at most about 0.5 percentage points with
+100,000 simulations):
 
 ```{r title-odds}
 title_odds <- sims |>
-  group_by(team, conf) |>
-  summarise(mean_wins    = mean(wins),
-            p_playoffs   = mean(!is.na(playoff_seed)),
-            p_finals     = mean(rounds_won >= 3),
-            titles       = sum(rounds_won == 4),
-            p_title      = titles / N_SIMS,
-            se           = sqrt(p_title * (1 - p_title) / N_SIMS),
-            .groups = "drop") |>
-  arrange(desc(p_title))
+  group_by(model, team, conf) |>
+  summarise(mean_wins  = mean(wins),
+            p_playoffs = mean(!is.na(playoff_seed)),
+            p_finals   = mean(rounds_won >= 3),
+            titles     = sum(rounds_won == 4),
+            p_title    = titles / N_SIMS,
+            se         = sqrt(p_title * (1 - p_title) / N_SIMS),
+            .groups = "drop")
 
 title_odds |>
-  transmute(Team = team, `Mean wins` = round(mean_wins, 1),
-            `Make playoffs` = percent(p_playoffs, 0.1),
-            `Reach Finals` = percent(p_finals, 0.1),
-            `Win title` = percent(p_title, 0.1),
-            `± SE` = percent(se, 0.1),
-            `Titles (of sims)` = titles) |>
-  kable()
+  select(model, team, mean_wins, p_title) |>
+  pivot_wider(names_from = model, values_from = c(mean_wins, p_title), names_vary = "slowest") |>
+  arrange(desc(.data[[paste0("p_title_", levels(sims$model)[2])]])) |>
+  mutate(across(starts_with("mean_wins"), ~ round(.x, 1)),
+         across(starts_with("p_title"), ~ percent(.x, 0.1))) |>
+  kable(col.names = c("Team", paste(c("Mean wins,", "Title %,"), rep(levels(sims$model), each = 2))[c(1, 2, 3, 4)]))
 ```
 
 ```{r title-plot}
 title_odds |>
-  mutate(team = reorder(team, p_title),
-         focus = team == FOCUS_TEAM) |>
-  ggplot(aes(team, p_title, fill = focus)) +
-  geom_col(show.legend = FALSE) +
-  scale_fill_manual(values = c(`TRUE` = "#F58426", `FALSE` = "grey70")) +
+  group_by(team) |> mutate(ord = max(p_title)) |> ungroup() |>
+  mutate(team = reorder(team, ord), focus = team == FOCUS_TEAM) |>
+  ggplot(aes(team, p_title, fill = model, alpha = focus)) +
+  geom_col(position = "dodge") +
+  scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.55), guide = "none") +
+  scale_fill_manual(values = c("#006BB6", "#F58426")) +
   scale_y_continuous(labels = percent) +
   coord_flip() +
-  labs(title = "Simulated championship probability", x = NULL, y = NULL)
+  labs(title = "Simulated championship probability (Knicks fully opaque)", x = NULL, y = NULL, fill = NULL)
 ```
 
 ```{r anomaly-metrics}
-p_k    <- title_odds$p_title[title_odds$team == FOCUS_TEAM]
-rank_k <- which(title_odds$team == FOCUS_TEAM)
-# probability that the champion in a typical season is a team with title odds <= the Knicks'
-p_longshot <- sum(title_odds$p_title[title_odds$p_title <= p_k])
+anomaly <- title_odds |>
+  group_by(model) |>
+  mutate(rank = rank(-p_title, ties.method = "min")) |>
+  summarise(
+    p_knicks    = p_title[team == FOCUS_TEAM],
+    rank_knicks = rank[team == FOCUS_TEAM],
+    # chance that a typical season's champion has title odds at or below the Knicks'
+    p_longshot  = sum(p_title[p_title <= p_title[team == FOCUS_TEAM]]),
+    .groups = "drop")
 
-# how often does the *actual-looking* season arise: Knicks as champion AND outside East top seed, etc.
-p_champ_not1 <- mean(k_sims$rounds_won == 4 & k_sims$conf_rank > 1) / max(mean(k_sims$rounds_won == 4), 1e-12)
+anomaly |>
+  transmute(Model = model,
+            `P(Knicks win title)` = percent(p_knicks, 0.1),
+            `About 1 in` = round(1 / p_knicks),
+            `Rank among 30 teams` = rank_knicks,
+            `P(champion is a team at least this unlikely)` = percent(p_longshot, 0.1)) |>
+  kable()
 ```
 
-* The model gives the Knicks a **`r percent(p_k, 0.1)`** chance to win the title
-  (**#`r rank_k`** of 30 teams). That is about **1 in `r round(1 / p_k)`**.
-* In a typical simulated season, the champion is a team with title odds at or below the Knicks'
-  roughly **`r percent(p_longshot, 0.1)`** of the time, so a champion like the Knicks is
-  `r if (p_longshot > 0.25) "not especially surprising" else if (p_longshot > 0.10) "somewhat surprising" else "genuinely surprising"`
-  by this model.
-* When the Knicks do win the title in the simulations, they were the East's #1 seed
-  **`r percent(1 - p_champ_not1, 0.1)`** of the time.
+The last column is the cleanest "anomaly" measure: in a typical
+simulated season, how often does the champion turn out to be a team with
+title odds no better than the Knicks'? A large number means a champion
+like the Knicks is ordinary. A small number means it would be a genuine
+surprise.
 
-::: {.callout-note}
+::: callout-note
 ## Interpreting "anomaly"
-Ratings come from the same 82 games used to define the regular-season standings, so the model's
-*mean* Knicks win total will sit near their actual total. The interesting question is the **spread**:
-how many different seasons could have plausibly happened for the same underlying team quality? The title
-probability is the cleanest summary of that. A ~`r percent(p_k, 0)` chance isn't an anomaly for
-*any one team*; it's the same kind of thing as a team with a 10–15% pre-season number winning. See the
-"champion's probability" check above for league-wide context.
 
-Also note the model doesn't capture playoff-specific effects (shortened rotations, star usage,
-injuries, in-season roster changes). A team that was truly better in the playoffs than its
-regular-season rating suggests will look "lucky" here.
+Ratings are estimated from the same 82 games that define the standings,
+so the *average* simulated Knicks record sits near their actual record.
+The informative quantity is the **spread** of seasons a team of that
+quality could have had, and the resulting title probability. Neither
+model captures playoff-specific effects (shortened rotations, star
+usage, injuries, in-season roster changes). A team that was truly better
+in the playoffs than its regular-season profile suggests will look
+"lucky" here.
 :::
+
+### Finals matchups
+
+Every simulation records the champion and the runner-up, so matchup
+events come for free (the event "Team A and Team B make the Finals and
+Team A wins" from the project description).
+
+```{r finals-matchups}
+finals <- sims |>
+  filter(rounds_won >= 3) |>
+  group_by(model, sim) |>
+  summarise(champion = team[rounds_won == 4], runner_up = team[rounds_won == 3], .groups = "drop")
+
+finals |>
+  count(model, champion, runner_up, sort = TRUE) |>
+  group_by(model) |> slice_head(n = 8) |> ungroup() |>
+  mutate(p = percent(n / N_SIMS, 0.1)) |>
+  select(Model = model, Champion = champion, `Runner-up` = runner_up, `P(this exact result)` = p) |>
+  kable()
+```
+
+When the Knicks win the title, whom do they beat?
+
+```{r knicks-finals}
+finals |>
+  filter(champion == FOCUS_TEAM) |>
+  count(model, runner_up) |>
+  group_by(model) |> mutate(`Share of Knicks titles` = percent(n / sum(n), 0.1)) |>
+  slice_max(n, n = 5) |> ungroup() |>
+  select(Model = model, `Runner-up` = runner_up, Titles = n, `Share of Knicks titles`) |>
+  kable()
+```
 
 ## Seeds and championships
 
-How likely is each **playoff seed** (1–8, after the play-in, pooled across both conferences) to win a round, reach the Finals, and win the title?
+How likely is each **playoff seed** (1–8, after the play-in, pooled
+across both conferences) to win a round, reach the Finals, and win the
+title?
 
 ```{r seed-table}
 seed_tbl <- sims |>
   filter(!is.na(playoff_seed)) |>
-  group_by(playoff_seed) |>
+  group_by(model, playoff_seed) |>
   summarise(
-    team_seasons = n(),
-    p_win_r1   = mean(rounds_won >= 1),
+    p_win_r1      = mean(rounds_won >= 1),
     p_conf_finals = mean(rounds_won >= 2),
-    p_finals   = mean(rounds_won >= 3),
-    p_title    = mean(rounds_won == 4),
-    titles     = sum(rounds_won == 4),
-    .groups = "drop"
-  ) |>
+    p_finals      = mean(rounds_won >= 3),
+    p_title       = mean(rounds_won == 4),
+    titles        = sum(rounds_won == 4),
+    .groups = "drop") |>
   mutate(share_of_all_titles = titles / N_SIMS)
 
 seed_tbl |>
-  transmute(Seed = playoff_seed,
+  transmute(Model = model, Seed = playoff_seed,
             `Win R1` = percent(p_win_r1, 0.1),
             `Reach conf finals` = percent(p_conf_finals, 0.1),
             `Reach Finals` = percent(p_finals, 0.1),
@@ -536,11 +907,11 @@ seed_tbl |>
 ```
 
 ```{r seed-plot}
-seed_tbl |>
-  ggplot(aes(factor(playoff_seed), p_title)) +
+ggplot(seed_tbl, aes(factor(playoff_seed), p_title)) +
   geom_col(fill = "#006BB6") +
   geom_text(aes(label = percent(p_title, 0.1)), vjust = -0.4, size = 3) +
-  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.1))) +
+  facet_wrap(~model) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.12))) +
   labs(title = "P(win the title) by playoff seed",
        subtitle = "Per-team probability, pooled across both conferences",
        x = "Playoff seed (after play-in)", y = NULL)
@@ -548,50 +919,59 @@ seed_tbl |>
 
 And by team: how often does each team land each playoff seed?
 
-```{r seed-heatmap}
-seed_by_team <- sims |>
-  mutate(seed_lab = if_else(is.na(playoff_seed), "Out", as.character(playoff_seed))) |>
-  count(team, conf, seed_lab) |>
-  mutate(p = n / N_SIMS)
-
-seed_by_team |>
-  mutate(seed_lab = factor(seed_lab, levels = c(as.character(1:8), "Out"))) |>
-  ggplot(aes(seed_lab, reorder(team, p * (seed_lab == "1")), fill = p)) +
+```{r seed-heatmap, fig.height = 11}
+sims |>
+  mutate(seed_lab = factor(if_else(is.na(playoff_seed), "Out", as.character(playoff_seed)),
+                           levels = c(as.character(1:8), "Out"))) |>
+  count(model, team, conf, seed_lab) |>
+  mutate(p = n / N_SIMS) |>
+  ggplot(aes(seed_lab, team, fill = p)) +
   geom_tile() +
   scale_fill_gradient(low = "white", high = "#006BB6", labels = percent) +
-  facet_wrap(~conf, scales = "free_y") +
+  facet_grid(conf ~ model, scales = "free_y") +
   labs(x = "Playoff seed", y = NULL, fill = "Probability")
 ```
 
 ## Reusable queries
 
-Everything above can be regenerated from the saved `sims` table. A few helpers for later:
+Everything above can be regenerated from the saved `sims` table
+(`readRDS("nba_sims_2026.rds")`).
 
 ```{r helpers}
-# P(team wins title | team lands a given playoff seed)
+# P(team wins title | team lands a given playoff seed), by model
 title_given_seed <- function(team_name, seed) {
-  d <- sims |> filter(team == team_name, playoff_seed == seed)
-  c(n = nrow(d), p_title = mean(d$rounds_won == 4))
+  sims |> filter(team == team_name, playoff_seed == seed) |>
+    group_by(model) |> summarise(n = n(), p_title = mean(rounds_won == 4), .groups = "drop")
 }
+title_given_seed(FOCUS_TEAM, 1)
 
-# Which team wins the most titles?
-title_odds |> slice_head(n = 5) |> select(team, titles, p_title)
-
-# Title odds by (conference rank) instead of playoff seed
-sims |>
-  filter(conf_rank <= 10) |>
-  group_by(conf_rank) |>
-  summarise(p_title = mean(rounds_won == 4), .groups = "drop") |>
-  kable(digits = 4)
-
-# Finals matchups
-# (not tracked explicitly; extend simulate_chunk() to return fin$win / fin$lose if you want these.)
+# Which teams win the most titles?
+title_odds |> arrange(model, desc(titles)) |> group_by(model) |> slice_head(n = 5) |>
+  select(model, team, titles, p_title) |> kable(digits = 4)
 ```
 
-## Notes and caveats
+## Notes and limitations
 
-* **Ratings are static** across the whole season and playoffs, and the model ignores injuries, rest days, and rosters changing mid-season.
-* **Seeding tiebreakers** are random rather than the official NBA rules.
-* **Home-court advantage** is one league-wide constant (also used in the playoffs). It can be extended to team-specific home advantage with a second set of parameters.
-* `PARAM_UNCERTAINTY <- FALSE` reproduces the "point-estimate only" version, which will give much more concentrated (and overconfident) title odds. Comparing the two is a good robustness check.
-* To use margin of victory instead of win/loss, replace the logistic fit with a normal (point-spread) model; the simulation engine's structure stays the same.
+- **Team strength constant within Model 1.** Model 1's ratings don't
+  change during the season; Model 2's do, but only through recent
+  scoring.
+- **Offense/defense come from points per game, not per possession.** The
+  schedule feed has final scores only, so fast- and slow-paced teams are
+  not separated and opponent strength is not adjusted for. Adding
+  possessions (from team box scores) or opponent-adjusted scores would
+  sharpen Model 2.
+- **Model 2 in the playoffs is frozen** at end-of-regular-season scores
+  and not updated through the playoffs.
+- **Model 2 simulation needs a points model.** Winners come from the
+  Bradley-Terry probability and points are generated consistently with
+  them; a team's *true* offense/defense inside the simulation come from
+  the full-season points model, so these are in-sample estimates
+  (uncertainty is included through the parameter draws).
+- **Tuning constants** (`HALF_LIFE`, `PRIOR_GAMES`) were not optimized.
+  They can be tuned by out-of-sample log-loss, as in the comparison
+  above.
+- **Seeding tiebreakers** are random rather than the official NBA rules,
+  and home-court advantage is one league-wide constant.
+- **Injuries, trades, and rest** are not modeled.
+- `PARAM_UNCERTAINTY <- FALSE` reproduces point-estimate-only
+  simulations, which are more concentrated (overconfident) than reality.
