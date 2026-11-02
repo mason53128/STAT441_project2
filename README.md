@@ -7,7 +7,7 @@ Team ID: `__` (two digits; goes in every file name)
  
 ---
  
-## 1. Model and simulation (`knicks_bradley_terry.qmd`)
+## 1. Model and simulation (`09_project.qmd`)
  
 ### Data
 - [x] Load 2025–26 regular-season results (`hoopR::load_nba_schedule(2026)`)
@@ -19,28 +19,28 @@ Team ID: `__` (two digits; goes in every file name)
 - [x] Bradley-Terry model with home-court advantage, fit as a logistic regression
 - [x] Team ratings table and home-court estimate
 - [x] Calibration check (model-expected wins vs. actual wins)
-- [ ] *(Encouraged by the assignment)* Test whether latent strength varies with covariates, e.g. team offensive/defensive rating, using `BradleyTerry2`. Compare to the plain model.
+- [x] *(Encouraged by the assignment)* Test whether latent strength varies with covariates, e.g. team offensive/defensive rating, using `BradleyTerry2`. Compare to the plain model.
 ### Simulation
 - [x] Simulate the full 1,230-game regular season
 - [x] Conference seeding (random tiebreaks)
 - [x] Play-in tournament (7v8, 9v10, loser vs. winner)
 - [x] Best-of-7 playoffs with 2-2-1-1-1 home court, through the Finals
 - [x] Parameter uncertainty (fresh ratings drawn each simulation)
-- [x] At least 10,000 replications (`N_SIMS <- 10000`, which is above the 500 minimum)
+- [x] At least 10,000 replications (`N_SIMS <- 100000`, which is above the 500 minimum)
 - [x] Keep every team's result in every sim (`wins`, `conf_rank`, `playoff_seed`, `rounds_won`)
-- [x] Save results to `nba_sims_2026.rds`
+- [x] Save results to `data/nba_sims_2026.rds`
 - [x] Integrity checks (one champion per sim, 8 playoff teams per conference)
 - [ ] Run on the real data and check the output looks sensible (e.g. title probabilities sum to 100%)
-- [ ] Set and report a fixed seed for reproducibility (`SEED`)
+- [x] Set and report a fixed seed for reproducibility (`SEED`)
 ### Events of interest (must be clearly stated and motivated)
 - [x] Knicks' simulated wins and conference rank vs. actual
 - [x] P(Knicks win the title) and how surprising that champion is
 - [x] P(each team wins the title), the most likely champions
 - [x] P(each playoff seed wins a round / reaches the Finals / wins the title)
-- [ ] **Finals matchups.** The assignment suggests events like "Team A and Team B make the Finals and Team A wins". The code doesn't track these yet, so return `fin$win` / `fin$lose` from `simulate_chunk()`.
-- [ ] Decide on a final short list (3–5) of events and write a sentence on why each matters
-- [ ] Compare `PARAM_UNCERTAINTY = TRUE` vs. `FALSE` as a robustness check
-- [ ] A few concrete examples to complement the numbers (e.g. a specific simulated season where the Knicks win)
+- [x] **Finals matchups.** The assignment suggests events like "Team A and Team B make the Finals and Team A wins". Tracked in the report via the champion and runner-up (`rounds_won`).
+- [x] Decide on a final short list (3–5) of events and write a sentence on why each matters
+- [x] Compare `PARAM_UNCERTAINTY = TRUE` vs. `FALSE` as a robustness check
+- [x] A few concrete examples to complement the numbers (e.g. a specific simulated season where the Knicks win)
 ---
  
 ## 2. Written report (PDF)
