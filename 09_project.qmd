@@ -38,6 +38,8 @@ On games they had not seen (the final fifth of the regular season), each model p
 
 # Technical Report
 
+The report proceeds in two moves. The first builds and checks the tool: the data, the two forecasting models, and the checks that they give trustworthy probabilities. The second uses it: the simulation replays the season and estimates the probabilities of the events of interest, returning to the Knicks' championship in particular. Each results section ends by connecting its numbers back to those events.
+
 ## Problem and Motivation
 
 A championship is a rare, high-variance event. Even a very good team has to win four consecutive best-of-seven series, and each game is a noisy contest, so the best team in the league wins the title far less than half of the time. This makes "the Knicks won" hard to interpret on its own: was it the expected outcome for a team of their quality, or a long shot that happened to come through?
@@ -88,7 +90,7 @@ HALF_LIFE          <- 20        # a game's weight halves after this many of the 
 PRIOR_GAMES        <- 8         # shrinkage toward average: equal to this many "average" games
 TEST_FRAC          <- 0.20      # last 20% of the regular season held out for evaluation
 
-GAMES_CSV          <- NULL      # optional: CSV with columns date, home, away, home_pts, away_pts, [neutral]
+GAMES_CSV          <- "data/nba_games.csv"      # CSV with columns date, home, away, home_pts, away_pts, neutral.
 dir.create("data", showWarnings = FALSE)
 SIMS_FILE          <- "data/nba_sims_2026.rds"
 RERUN_SIMS         <- FALSE     # FALSE: reuse the saved simulations if the file exists
@@ -136,7 +138,7 @@ stopifnot(n_teams == 30)
 
 ### Downloading and cleaning the games
 
-The ESPN feed is not a clean list of the 82-game seasons, so several kinds of rows have to be removed before any model is fit. Fitting a Bradley-Terry model to the wrong games would distort the team ratings, and, because the simulation replays the actual schedule, it would also give teams the wrong number of games.
+The ESPN feed is not a clean list of the 82-game seasons, so several kinds of rows have to be removed before any model is fit. Fitting a Bradley-Terry model to the wrong games would distort the team ratings, and, because the simulation replays the actual schedule, it would also give teams the wrong number of games. We pay extra attention on these.
 
 - **All-Star weekend games and the NBA Cup championship game** are tagged as regular season in the feed but do not count toward the 82 games. (The Cup group-stage games and the Cup quarterfinals and semifinals *do* count, so they stay.)
 - **Postponed games** leave a 0–0 placeholder row at the original date, and the real result appears again in a separate "makeup" row. We drop the placeholders so that each game is counted once.
@@ -250,6 +252,8 @@ We want Model 2's inputs to reflect what a forecaster would have known *just bef
 - **Recent games count more.** A game's weight is cut in half for every `HALF_LIFE` = 20 of the team's games after it. This lets the scores react to injuries, trades, and hot or cold stretches.
 - **Early-season scores are shrunk toward average.** With only a few games played, a team's averages are very noisy, so we add `PRIOR_GAMES` = 8 imaginary games at exactly league-average performance. As the season goes on, the real games dominate.
 
+**Why eight games?** The number is a deliberate but simple choice, not something estimated from the data. It acts like a prior that starts each season at league average and fades as real games arrive: after $g$ games the imaginary average games still carry weight $8/(g+8)$, so they make up half the weight after 8 games and a quarter after 24. A much smaller number (say 1-2) would leave the first few scores jumpy, because one lopsided game could swing them a long way; a much larger number would pin the scores near 0 and stop them from reflecting actual play. Eight is roughly two weeks of an NBA schedule, long enough for real games to start dominating but short enough that the scores stay responsive. Like `HALF_LIFE`, this is a judgment call; choosing it by held-out log-loss is listed under Future Work.
+
 Formally, with $x_k$ the points a team scored in its $k$-th earlier game, $a_k$ the number of that team's games since then, and $\bar p$ the league-average points per team per game:
 
 $$O_j(t)=\frac{\sum_{k<t} w_k\,(x_k-\bar p)}{\sum_{k<t} w_k + c},\qquad
@@ -311,6 +315,8 @@ ggplot(knicks_dyn, aes(team_game, value, colour = Score)) +
 ```
 
 The plot shows the scores doing what we want: they move. Over the season the Knicks' offensive score ranges from about −1.7 to +4.3 points per game relative to the league, and it ends slightly below average (about −0.7). Their defensive score is the more stable and more impressive of the two, staying between about −0.7 and +6.1 and ending near +6.0 points per game better than average. In other words, the model sees the Knicks as a defense-first team whose scoring was about average. The plot also shows why the scores are shrunk: early in the year one lopsided game can swing them substantially, while by mid-season they move slowly.
+
+For the events of interest, the point of having two models is that they give two different, defensible views of the same season: one from a fixed strength rating, the other from how each team was actually playing. Both feed the same simulation.
 
 ## Evaluation Criteria
 
@@ -428,7 +434,12 @@ tibble(Team = teams$team, `Team effect (u)` = round(U_cfg$mean, 3)) |>
   kable(caption = "Teams with the five largest and five smallest team effects")
 ```
 
-How to read these tables: each score coefficient is the change in the log-odds that the home team wins for each additional point per game of that score *relative to the opponent*. An extra point of offensive score multiplies the home team's odds of winning by about 1.12 (exp(0.110)), and an extra point of defensive score by about 1.18 (exp(0.166)). Both are clearly different from zero (about 5 and 9 standard errors), and defense carries more weight than offense per point. The home-court coefficient (0.263) is close to Model 1's (0.283). The team effects are small but meaningful: their standard deviation is about 0.21 on the log-odds scale. They are largest for San Antonio (+0.26) and the Lakers (+0.25), teams that won more than their scoring suggests, and most negative for Brooklyn (−0.26) and Indiana (−0.21). The Knicks' effect is close to zero (+0.04), so the model sees them as exactly as good as their scoring says.
+**How to read these tables.** Each coefficient is the change in the log-odds that the home team wins, for each additional point per game of that score *relative to the opponent*.
+
+- **Offensive score (+0.110).** One extra point multiplies the home team's odds of winning by about 1.12 (exp(0.110)); the estimate is about 5 standard errors from zero.
+- **Defensive score (+0.166).** One extra point multiplies the odds by about 1.18 (exp(0.166)); about 9 standard errors from zero. Defense therefore moves the odds more per point than offense.
+- **Home court (+0.263).** Close to Model 1's estimate (0.283).
+- **Team effects (SD about 0.21).** Small but meaningful. They are largest for San Antonio (+0.26) and the Lakers (+0.25), who won more than their scoring suggests, and most negative for Brooklyn (−0.26) and Indiana (−0.21). The Knicks' effect is nearly zero (+0.04), so the model sees them as exactly as good as their scoring says.
 
 ## Results: Do the Dynamic Scores Help?
 
@@ -462,7 +473,24 @@ cmp <- bind_rows(
 kable(cmp, digits = 4)
 ```
 
-The comparison tells us two things. First, in-sample, Model 1 fits the games it was trained on slightly better than Model 2 (log-loss 0.569 versus 0.583). Second, and more important, on the held-out games the two models are essentially tied: log-loss 0.5062 for Model 1 versus 0.5052 for Model 2, with accuracy of 78.0% and 78.5%. The difference is far smaller than the noise in about 250 test games, so we do not claim either model predicts better. Both are far better than the home-court-only baseline (log-loss 0.680, 59.8% accuracy), so both extract real information about team quality. Model 2 matches the 30-parameter model out of sample while using a team's recent scoring and defense and a shrunken team effect, which supports using it as a second view of how strong each team was.
+```{r compare-plot}
+#| fig-height: 3.5
+cmp |>
+  mutate(Evaluation = factor(Evaluation, levels = c("In-sample", "Out-of-sample"))) |>
+  ggplot(aes(Evaluation, `Log-loss`, fill = Model)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c("Home court only" = "grey70",
+                               "Model 1 (team strengths)" = "#006BB6",
+                               "Model 2 (dynamic scores + team effect)" = "#F58426")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Model comparison: log-loss (lower is better)",
+       x = NULL, y = "Log-loss", fill = NULL) +
+  theme_minimal()
+```
+
+The table gives the exact numbers and the figure below shows them side by side. The comparison tells us two things. First, in-sample, Model 1 fits the games it was trained on slightly better than Model 2 (log-loss 0.569 versus 0.583). Second, and more important, on the held-out games the two models are essentially tied: log-loss 0.5062 for Model 1 versus 0.5052 for Model 2, with accuracy of 78.0% and 78.5%. The difference is far smaller than the noise in about 250 test games, so we do not claim either model predicts better. Both are far better than the home-court-only baseline (log-loss 0.680, 59.8% accuracy), so both extract real information about team quality. Model 2 matches the 30-parameter model out of sample while using a team's recent scoring and defense and a shrunken team effect, which supports using it as a second view of how strong each team was.
+
+For the events of interest, this is the key result: because neither model can be dismissed out of sample, we report both, and the gap between what they say about the Knicks becomes part of the answer rather than a choice between two conflicting forecasts.
 
 ### Are the probabilities calibrated?
 
@@ -514,6 +542,8 @@ ggplot(calib_t, aes(e, actual_wins, label = team)) +
 
 In the Model 1 panel every team sits exactly on the diagonal. That is not a test of the model: a Bradley-Terry fit of this kind reproduces each team's actual win total exactly by construction, so the held-out calibration check above is the real test. Model 2 has no such guarantee, and its expected wins miss the actual totals by a typical 3.0 wins (at most 6.3 for the worst team), so it is the panel to study. Teams above the diagonal won more games than their scoring profile suggests, and teams below it won fewer. We return to these teams in the results below, since they are the "lucky" and "unlucky" teams of our simulation.
 
+The upshot for the simulation is that the probabilities fed into it are calibrated, so the event probabilities estimated below are meaningful rather than artifacts of over- or under-confident models.
+
 ## Simulation Design
 
 We now use the fitted models to replay the season. Both models feed the same bracket machinery, and they differ in how regular-season games are simulated and in whether scores keep updating in the playoffs. We describe the pieces in turn.
@@ -526,7 +556,7 @@ We now use the fitted models to replay the season. Both models feed the same bra
 - **The playoffs.** Four rounds of best-of-seven series in a 2-2-1-1-1 home/away pattern, with the higher seed hosting. The Finals' home court goes to the team with more regular-season wins.
 - **Parameter uncertainty.** The fitted parameters are only estimates, so each simulation draws its own parameters from a normal distribution centered at the estimates, using the estimated covariance matrix. Skipping this step would treat estimated team strengths as exactly known and make every simulated season more predictable than reality.
 
-As in Lecture 13, **every simulation saves every team's results**: wins, conference rank, playoff seed, and how many playoff rounds the team won. The simulated events in the results are then just counts from one large table.
+**Every simulation saves every team's results**: wins, conference rank, playoff seed, and how many playoff rounds the team won. The simulated events in the results are then just counts from one large table.
 
 ### Shared playoff machinery
 
@@ -588,11 +618,11 @@ sim_conference <- function(S, P, rounds_won, playoff_seed) {
   T8   <- rbind(S[1:6, , drop = FALSE], w78, g3)          # row = playoff seed (1..8)
   for (s in 1:8) playoff_seed <- rec(playoff_seed, T8[s, ], s)
 
-  sd <- function(s) rep(s, n)
-  a <- series_by_seed(T8[1, ], sd(1), T8[8, ], sd(8), P)
-  b <- series_by_seed(T8[4, ], sd(4), T8[5, ], sd(5), P)
-  c <- series_by_seed(T8[3, ], sd(3), T8[6, ], sd(6), P)
-  d <- series_by_seed(T8[2, ], sd(2), T8[7, ], sd(7), P)
+  seed_score <- function(s) rep(s, n)
+  a <- series_by_seed(T8[1, ], seed_score(1), T8[8, ], seed_score(8), P)
+  b <- series_by_seed(T8[4, ], seed_score(4), T8[5, ], seed_score(5), P)
+  c <- series_by_seed(T8[3, ], seed_score(3), T8[6, ], seed_score(6), P)
+  d <- series_by_seed(T8[2, ], seed_score(2), T8[7, ], seed_score(7), P)
   for (x in list(a, b, c, d)) rounds_won <- rec(rounds_won, x$lose, 0L)
   e <- series_by_seed(a$win, a$win_seed, b$win, b$win_seed, P)
   f <- series_by_seed(c$win, c$win_seed, d$win, d$win_seed, P)
@@ -1151,4 +1181,4 @@ The Knicks' most likely outcome is the 3 seed under Model 1 (their actual seed) 
 
 ## Reproducing This Work
 
-Install the packages `dplyr`, `tidyr`, `ggplot2`, `scales`, `knitr`, `tibble`, `readr`, `BradleyTerry2`, and `hoopR`. Render `report.qmd` with `quarto render report.qmd` (HTML) or `quarto render report.qmd --to pdf`. The schedule is downloaded from `hoopR` on each render. The simulations for both models are saved to `data/nba_sims_2026.rds` the first time and reloaded afterward (they are re-run automatically if `N_SIMS` or the models change) unless `RERUN_SIMS <- FALSE` is changed to `TRUE`. The seed (`SEED = 2026`) is set before each model's simulations, so the results in the text can be reproduced exactly. The numbers quoted in the written text come from a run on the schedule data as downloaded in early November 2026. If ESPN later revises scores, small differences are possible, and the text would need to be updated to match.
+Install the packages `dplyr`, `tidyr`, `ggplot2`, `scales`, `knitr`, `tibble`, `readr`, `BradleyTerry2`, and `hoopR`. Render `09_project.qmd` with `quarto render 09_project.qmd` (HTML) or `quarto render 09_project.qmd --to pdf`. The schedule is loaded from `data/nba_games.csv` (or downloaded live from `hoopR` when `GAMES_CSV <- NULL`). The simulations for both models are saved to `data/nba_sims_2026.rds` the first time and reloaded afterward (they are re-run automatically if `N_SIMS` or the models change) unless `RERUN_SIMS <- FALSE` is changed to `TRUE`. The seed (`SEED = 2026`) is set before each model's simulations, so the results in the text can be reproduced exactly. The numbers quoted in the written text come from a run on the schedule data as downloaded in early November 2026. If ESPN later revises scores, small differences are possible, and the text would need to be updated to match.
